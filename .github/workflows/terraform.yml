@@ -74,8 +74,8 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           RECIPIENT: ${{ github.event.inputs.recipient_email }}
+          TF_STATUS: ${{ job.status }}
         run: |
-          STATUS="${{ job.status }}"
           echo "Sending email to $RECIPIENT..."
           python3 - <<EOF
           import smtplib, os
@@ -86,20 +86,21 @@ jobs:
           smtp_user = os.getenv("SMTP_USER")
           smtp_password = os.getenv("SMTP_PASSWORD")
           recipient = os.getenv("RECIPIENT")
+          status = os.getenv("TF_STATUS")
           
           body = f"""
           Terraform Workflow Finished
           
           Destroy:  ${{ github.event.inputs.destroy }}
           Resource: ${{ github.event.inputs.resource }}
-          Status:   {STATUS}
+          Status:   {status}
           
           Regards,
           GitHub Actions Bot
           """
           
           msg = MIMEText(body)
-          msg["Subject"] = "Terraform Execution Result"
+          msg["Subject"] = f"Terraform Result - {status.upper()}"
           msg["From"] = smtp_user
           msg["To"] = recipient
           
@@ -112,3 +113,4 @@ jobs:
           except Exception as e:
               print(f"❌ Email sending failed: {e}")
           EOF
+          
