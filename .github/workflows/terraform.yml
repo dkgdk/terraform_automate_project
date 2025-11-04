@@ -3,16 +3,22 @@ name: Terraform Deploy
 on:
   workflow_dispatch:
     inputs:
-      destroy:
-        description: "Destroy infra? true/false"
-        required: true
-        default: "false"
       resource:
-        description: "Resource to apply (ec2/s3)"
+        type: choice
+        description: "Select resource to deploy"
         required: true
-        default: "ec2"
+        options:
+          - ec2
+          - s3
+      destroy:
+        type: choice
+        description: "Destroy instead of apply?"
+        required: true
+        options:
+          - "false"
+          - "true"
       emails:
-        description: "Comma separated email list"
+        description: "Enter comma separated email list"
         required: true
         default: "admin@example.com"
 
@@ -28,37 +34,40 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set script variables
-        id: vars
+      - name: Set environment variables
         run: |
-          echo "DESTROY=${{ github.event.inputs.destroy }}" >> $GITHUB_ENV
           echo "RESOURCE=${{ github.event.inputs.resource }}" >> $GITHUB_ENV
-          echo "EMAILS=${{ github.event.inputs.emails }}" >> $GITHUB_ENV
+          echo "DESTROY=${{ github.event.inputs.destroy }}" >> $GITHUB_ENV
+          echo "EMAILS='${{ github.event.inputs.emails }}'" >> $GITHUB_ENV
 
-      - name: Select resource folder
-        run: |
-          if [ "$RESOURCE" = "ec2" ]; then DIR="ec2"; fi
-          if [ "$RESOURCE" = "s3" ]; then DIR="s3"; fi
-          echo "DIR=$DIR" >> $GITHUB_ENV
+      - name: Install mailutils
+        run: sudo apt-get update && sudo apt-get install -y mailutils
 
       - name: Terraform Init
-        working-directory: ${{ github.workspace }}/${{ env.DIR }}
+        working-directory: ${{ github.workspace }}/${{ env.RESOURCE }}
         run: terraform init -input=false
 
-      - name: Terraform Apply/Destroy
-        working-directory: ${{ github.workspace }}/${{ env.DIR }}
+      - name: Terraform Apply or Destroy
+        working-directory: ${{ github.workspace }}/${{ env.RESOURCE }}
         run: |
           if [ "$DESTROY" = "true" ]; then
             terraform destroy -auto-approve
+            STATUS="Destroyed"
           else
             terraform apply -auto-approve
+            STATUS="Applied"
           fi
+          echo "STATUS=$STATUS" >> $GITHUB_ENV
 
       - name: Send Email Notification
         run: |
-          STATUS=$([ "$DESTROY" = "true" ] && echo "Destroyed" || echo "Applied")
           SUBJECT="Terraform $STATUS - $RESOURCE"
-          BODY="Terraform task finished.\n\nResource: $RESOURCE\nStatus: $STATUS\nRepo: $GITHUB_REPOSITORY\nRun ID: $GITHUB_RUN_ID"
+          BODY="Terraform completed successfully.
+
+          Resource: $RESOURCE
+          Action: $STATUS
+          Repository: $GITHUB_REPOSITORY
+          Run ID: $GITHUB_RUN_ID"
 
           echo "Sending email to: $EMAILS"
           IFS=',' read -ra MAILS <<< "$EMAILS"
