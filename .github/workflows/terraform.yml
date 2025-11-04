@@ -1,76 +1,114 @@
-name: Terraform Deploy
+name: Terraform Workflow
 
 on:
   workflow_dispatch:
     inputs:
-      resource:
-        type: choice
-        description: "Select resource to deploy"
-        required: true
-        options:
-          - ec2
-          - s3
       destroy:
         type: choice
-        description: "Destroy instead of apply?"
-        required: true
+        description: "Destroy resources?"
+        default: "no"
         options:
-          - "false"
-          - "true"
-      emails:
-        description: "Enter comma separated email list"
+          - "no"
+          - "yes"
+
+      resource:
+        type: choice
+        description: "Select resource type"
+        default: "all"
+        options:
+          - "all"
+          - "ec2"
+          - "s3"
+
+      recipient_email:
+        description: "Email to receive results"
         required: true
-        default: "admin@example.com"
+        default: "durgeshgupt.dg@gmail.com"
 
 jobs:
   terraform:
     runs-on: ubuntu-latest
+    
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       AWS_REGION: "ap-south-1"
+      BACKEND_BUCKET: "bucketfortfstatestorage"
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set environment variables
-        run: |
-          echo "RESOURCE=${{ github.event.inputs.resource }}" >> $GITHUB_ENV
-          echo "DESTROY=${{ github.event.inputs.destroy }}" >> $GITHUB_ENV
-          echo "EMAILS='${{ github.event.inputs.emails }}'" >> $GITHUB_ENV
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v3
 
-      - name: Install mailutils
-        run: sudo apt-get update && sudo apt-get install -y mailutils
+      - name: Show Selected Inputs
+        run: |
+          echo "Destroy: ${{ github.event.inputs.destroy }}"
+          echo "Resource: ${{ github.event.inputs.resource }}"
+          echo "Backend bucket: $BACKEND_BUCKET"
 
       - name: Terraform Init
-        working-directory: ${{ github.workspace }}/${{ env.RESOURCE }}
         run: terraform init -input=false
 
-      - name: Terraform Apply or Destroy
-        working-directory: ${{ github.workspace }}/${{ env.RESOURCE }}
+      - name: Terraform Plan
+        id: plan
+        run: terraform plan -out=tfplan
+
+      - name: Terraform Apply
+        if: github.event.inputs.destroy == 'no'
+        run: terraform apply -auto-approve tfplan
+
+      - name: Terraform Destroy
+        if: github.event.inputs.destroy == 'yes'
+        run: terraform destroy -auto-approve
+
+      ############################################################
+      # EMAIL NOTIFICATION
+      ############################################################
+      - name: Send Email Results
+        if: always()
+        env:
+          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          RECIPIENT: ${{ github.event.inputs.recipient_email }}
         run: |
-          if [ "$DESTROY" = "true" ]; then
-            terraform destroy -auto-approve
-            STATUS="Destroyed"
-          else
-            terraform apply -auto-approve
-            STATUS="Applied"
-          fi
-          echo "STATUS=$STATUS" >> $GITHUB_ENV
-
-      - name: Send Email Notification
-        run: |
-          SUBJECT="Terraform $STATUS - $RESOURCE"
-          BODY="Terraform completed successfully.
-
-          Resource: $RESOURCE
-          Action: $STATUS
-          Repository: $GITHUB_REPOSITORY
-          Run ID: $GITHUB_RUN_ID"
-
-          echo "Sending email to: $EMAILS"
-          IFS=',' read -ra MAILS <<< "$EMAILS"
-          for m in "${MAILS[@]}"; do
-            echo -e "$BODY" | mail -s "$SUBJECT" "$m"
-          done
+          STATUS="${{ job.status }}"
+          echo "Sending email to $RECIPIENT..."
+          python3 - <<EOF
+          import smtplib, os
+          from email.mime.text import MIMEText
+          
+          smtp_server = os.getenv("SMTP_SERVER")
+          smtp_port = int(os.getenv("SMTP_PORT"))
+          smtp_user = os.getenv("SMTP_USER")
+          smtp_password = os.getenv("SMTP_PASSWORD")
+          recipient = os.getenv("RECIPIENT")
+          
+          body = f"""
+          Terraform Workflow Finished
+          
+          Destroy:  ${{ github.event.inputs.destroy }}
+          Resource: ${{ github.event.inputs.resource }}
+          Status:   {STATUS}
+          
+          Regards,
+          GitHub Actions Bot
+          """
+          
+          msg = MIMEText(body)
+          msg["Subject"] = "Terraform Execution Result"
+          msg["From"] = smtp_user
+          msg["To"] = recipient
+          
+          try:
+              with smtplib.SMTP(smtp_server, smtp_port) as server:
+                  server.starttls()
+                  server.login(smtp_user, smtp_password)
+                  server.sendmail(smtp_user, recipient, msg.as_string())
+              print("✅ Email sent successfully!")
+          except Exception as e:
+              print(f"❌ Email sending failed: {e}")
+          EOF
