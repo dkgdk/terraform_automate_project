@@ -4,103 +4,67 @@ on:
   workflow_dispatch:
     inputs:
       destroy:
-        description: "Destroy resources?"
+        description: "Destroy infrastructure?"
         required: true
         default: "false"
-        type: boolean
       resource:
-        description: "Which resource to act on"
+        description: "Terraform folder (ec2/s3/etc)"
         required: true
-        default: "all"
-        type: choice
-        options:
-          - ec2
-          - s3
-          - all
+        default: "ec2"
       backend_bucket:
-        description: "S3 bucket for tfstate"
+        description: "S3 backend bucket name"
         required: true
         default: "bucketfortfstatestorage"
-        type: string
-      recipient_email:
-        description: "Email to receive deployment result"
-        required: true
-        type: string
-
-permissions:
-  contents: read
 
 jobs:
-  terraform:
+  deploy:
     runs-on: ubuntu-latest
-    env:
-      TF_IN_AUTOMATION: true
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
 
-      - name: Set up Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: "1.6.6"
+    - name: Checkout Code
+      uses: actions/checkout@v3
 
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v2
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ap-south-1
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
 
-      - name: Collect workflow inputs
-        id: params
-        run: |
-          echo "destroy=${{ github.event.inputs.destroy }}" >> $GITHUB_OUTPUT
-          echo "resource=${{ github.event.inputs.resource }}" >> $GITHUB_OUTPUT
-          echo "backend_bucket=${{ github.event.inputs.backend_bucket }}" >> $GITHUB_OUTPUT
-          echo "recipient_email=${{ github.event.inputs.recipient_email }}" >> $GITHUB_OUTPUT
+    - name: Terraform Init/Apply/Destroy
+      run: |
+        set -euo pipefail
+        echo "Destroy: ${{ github.event.inputs.destroy }}"
+        echo "Resource: ${{ github.event.inputs.resource }}"
+        echo "Backend bucket: ${{ github.event.inputs.backend_bucket }}"
 
-      - name: Run Terraform
-        id: deploy
-        run: |
-          set -euo pipefail
-          DESTROY="${{ steps.params.outputs.destroy }}"
-          RESOURCE="${{ steps.params.outputs.resource }}"
-          BUCKET="${{ steps.params.outputs.backend_bucket }}"
-          echo "Destroy: $DESTROY"
-          echo "Resource: $RESOURCE"
-          echo "Backend bucket: $BUCKET"
+        cd ${{ github.event.inputs.resource }}
 
-          modules=()
-          if [ "$RESOURCE" = "ec2" ] || [ "$RESOURCE" = "all" ]; then modules+=("ec2"); fi
-          if [ "$RESOURCE" = "s3" ] || [ "$RESOURCE" = "all" ]; then modules+=("s3"); fi
-
-          for m in "${modules[@]}"; do
-            echo "Working on module: $m"
-            cat <<'EOF' > "$m/backend.hcl"
-            bucket = "${BUCKET}"
-            key    = "${m}/terraform.tfstate"
+        cat > backend.tf <<EOF
+        terraform {
+          backend "s3" {
+            bucket = "${{ github.event.inputs.backend_bucket }}"
+            key    = "${{ github.event.inputs.resource }}/terraform.tfstate"
             region = "ap-south-1"
-            encrypt = true
-            EOF
+          }
+        }
+        EOF
 
-            cd "$m"
-            terraform init -backend-config=backend.hcl
-            if [ "$DESTROY" = "true" ]; then
-              terraform destroy -auto-approve
-            else
-              terraform apply -auto-approve
-            fi
-            terraform output -json > "../${m}_outputs.json" || true
-            cd ..
-          done
+        terraform init -input=false
 
-      - name: Send deployment email (if script exists)
-        if: always()
-        run: |
-          if [ -f "scripts/send_mail.sh" ]; then
-            chmod +x scripts/send_mail.sh
-            scripts/send_mail.sh "${{ steps.params.outputs.recipient_email }}"
-          else
-            echo "😡 ERROR: scripts/send_mail.sh not found. Skipping email."
-          fi
+        if [ "${{ github.event.inputs.destroy }}" = "true" ]; then
+          terraform destroy -auto-approve
+        else
+          terraform apply -auto-approve
+          terraform output -json > ../${{ github.event.inputs.resource }}_outputs.json
+        fi
+
+    - name: Make mail script executable
+      run: |
+        chmod +x scripts/send_mail.sh
+
+    - name: Send deployment mail
+      env:
+        SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+        SMTP_PORT: ${{ secrets.SMTP_PORT }}
+        SMTP_USER: ${{ secrets.SMTP_USER }}
+        SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+        RECIPIENT: ${{ secrets.RECIPIENT }}
+      run: |
+        ./scripts/send_mail.sh
