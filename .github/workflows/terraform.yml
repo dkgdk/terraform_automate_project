@@ -61,42 +61,42 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install email-validator
           python - <<'PY'
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-
-smtp_server = "${{ env.SMTP_SERVER }}"
-smtp_port = int("${{ env.SMTP_PORT }}")
-smtp_user = "${{ env.SMTP_USER }}"
-smtp_password = "${{ env.SMTP_PASSWORD }}"
-recipient = "${{ env.RECIPIENT }}"
-
-subject = "Terraform Execution Completed"
-body = f"""
-Hello,
-
-The Terraform workflow finished running.
-
-✅ Init:  ${{ steps.init.outcome }}
-✅ Plan:  ${{ steps.plan.outcome }}
-✅ Apply: ${{ steps.apply.outcome }}
-
-Regards,
-GitHub Actions Bot
-"""
-
-msg = MIMEMultipart()
-msg["From"] = smtp_user
-msg["To"] = recipient
-msg["Subject"] = subject
-msg.attach(MIMEText(body, "plain"))
-
-try:
-    with smtplib.SMTP(smtp_server, smtp_port) as server:
-        server.starttls()
-        server.login(smtp_user, smtp_password)
-        server.sendmail(smtp_user, recipient, msg.as_string())
-    print("Email sent successfully!")
-except Exception as e:
-    print(f"Error sending email: {e}")
-PY
+          import smtplib
+          from email.mime.text import MIMEText
+          from email.mime.multipart import MIMEMultipart
+          
+          smtp_server = "${{ env.SMTP_SERVER }}"
+          smtp_port = int("${{ env.SMTP_PORT }}")
+          smtp_user = "${{ env.SMTP_USER }}"
+          smtp_password = "${{ env.SMTP_PASSWORD }}"
+          recipient = "${{ env.RECIPIENT }}"
+          
+          subject = "Terraform Execution Completed"
+          body = f"""
+          Hello,
+          
+          The Terraform workflow finished running.
+          
+          ✅ Init:  ${{ steps.init.outcome }}
+          ✅ Plan:  ${{ steps.plan.outcome }}
+          ✅ Apply: ${{ steps.apply.outcome }}
+          
+          Regards,
+          GitHub Actions Bot
+          """
+          
+          msg = MIMEMultipart()
+          msg["From"] = smtp_user
+          msg["To"] = recipient
+          msg["Subject"] = subject
+          msg.attach(MIMEText(body, "plain"))
+          
+          try:
+              with smtplib.SMTP(smtp_server, smtp_port) as server:
+                  server.starttls()
+                  server.login(smtp_user, smtp_password)
+                  server.sendmail(smtp_user, recipient, msg.as_string())
+              print("Email sent successfully!")
+          except Exception as e:
+              print(f"Error sending email: {e}")
+          PY
