@@ -1,31 +1,32 @@
-name: Terraform deploy
+name: Terraform Deploy
 
 on:
   workflow_dispatch:
     inputs:
       destroy:
-        description: 'Destroy resources?'
+        description: "Destroy resources instead of creating?"
         required: true
-        default: 'false'
-        type: boolean
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
       resource:
-        description: 'Which resource to act on'
+        description: "Which resources to deploy/destroy?"
         required: true
-        default: 'all'
+        default: "all"
         type: choice
         options:
           - ec2
           - s3
           - all
       backend_bucket:
-        description: 'S3 bucket to store tfstate (create it with backend-bootstrap if not present)'
+        description: "S3 bucket for tfstate (default: bucketfortfstatestorage)"
         required: false
-        default: 'bucketfortfstatestorage'
-        type: string
+        default: "bucketfortfstatestorage"
       recipient_email:
-        description: 'Recipient email for deployment results'
+        description: "Email to send deployment results to"
         required: true
-        type: string
 
 permissions:
   contents: read
@@ -33,152 +34,85 @@ permissions:
 jobs:
   terraform:
     runs-on: ubuntu-latest
+
     env:
-      TF_IN_AUTOMATION: true
+      TF_IN_AUTOMATION: "true"
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: "ap-south-1"
 
     steps:
-      - name: Checkout repository
+      - name: Checkout repo
         uses: actions/checkout@v4
 
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.6"
+
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ap-south-1
 
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v2
-        with:
-          terraform_version: '1.5.0'
-
-      - name: Read inputs
-        id: read_inputs
+      - name: Prepare parameters
+        id: params
         run: |
           echo "destroy=${{ github.event.inputs.destroy }}" >> $GITHUB_OUTPUT
           echo "resource=${{ github.event.inputs.resource }}" >> $GITHUB_OUTPUT
           echo "backend_bucket=${{ github.event.inputs.backend_bucket }}" >> $GITHUB_OUTPUT
           echo "recipient_email=${{ github.event.inputs.recipient_email }}" >> $GITHUB_OUTPUT
 
-      - name: Run terraform modules (apply/destroy)
-        id: run_terraform
-        shell: bash
+      - name: Run Terraform per module
+        id: tf_run
         run: |
           set -euo pipefail
+          DESTROY="${{ steps.params.outputs.destroy }}"
+          RESOURCE="${{ steps.params.outputs.resource }}"
+          BUCKET="${{ steps.params.outputs.backend_bucket }}"
 
-          DESTROY="${{ steps.read_inputs.outputs.destroy }}"
-          RESOURCE="${{ steps.read_inputs.outputs.resource }}"
-          BUCKET="${{ steps.read_inputs.outputs.backend_bucket }}"
-          RECIPIENT="${{ steps.read_inputs.outputs.recipient_email }}"
+          MODULES=()
 
-          # normalize default backend bucket if blank
-          if [ -z "$BUCKET" ] || [ "$BUCKET" = "null" ]; then
-            BUCKET="bucketfortfstatestorage"
-          fi
-
-          echo "Destroy: $DESTROY"
-          echo "Resource: $RESOURCE"
-          echo "Backend bucket: $BUCKET"
-          echo "Recipient: $RECIPIENT"
-
-          apply_dirs=()
           if [ "$RESOURCE" = "ec2" ] || [ "$RESOURCE" = "all" ]; then
-            apply_dirs+=("ec2")
+            MODULES+=("ec2")
           fi
           if [ "$RESOURCE" = "s3" ] || [ "$RESOURCE" = "all" ]; then
-            apply_dirs+=("s3")
+            MODULES+=("s3")
           fi
 
-          # Clean previous output files
-          rm -f ec2_outputs.json s3_outputs.json || true
+          for m in "${MODULES[@]}"; do
+            echo "🚀 Processing module: $m"
 
-          for d in "${apply_dirs[@]}"; do
-            echo "=== Working on module: $d ==="
-
-            # create backend.hcl for this module
-            cat > $d/backend.hcl <<EOF
-            bucket = "${BUCKET}"
-            key    = "${d}/terraform.tfstate"
+            cat > "$m/backend.hcl" <<EOF
+            bucket = "$BUCKET"
+            key    = "$m/terraform.tfstate"
             region = "ap-south-1"
             encrypt = true
             EOF
 
-            pushd $d
-
-            # Initialize with backend config
-            terraform init -input=false -backend-config=backend.hcl
+            cd "$m"
+            terraform init -backend-config=backend.hcl
 
             if [ "$DESTROY" = "true" ]; then
-              echo "Destroying module $d"
-              terraform destroy -auto-approve -input=false || true
+              terraform destroy -auto-approve || true
             else
-              echo "Applying module $d"
-              terraform apply -auto-approve -input=false
+              terraform apply -auto-approve
             fi
 
-            # Export outputs to repo root for the email step (if outputs exist)
-            terraform output -json > ../${d}_outputs.json || echo "{}" > ../${d}_outputs.json
-
-            popd
+            terraform output -json > "../${m}_outputs.json" || true
+            cd ..
           done
 
-      - name: Set up Python (for email)
+      - name: Send Email with results
         if: always()
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.x'
-
-      - name: Send email with results
-        if: always()
+        run: |
+          chmod +x scripts/send_mail.sh
+          ./scripts/send_mail.sh
         env:
           SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-          RECIPIENT: ${{ github.event.inputs.recipient_email }}
-        run: |
-          python - <<'PY'
-          import os, json, smtplib
-          from email.message import EmailMessage
-          
-          smtp_server = os.getenv("SMTP_SERVER")
-          smtp_port = int(os.getenv("SMTP_PORT") or 587)
-          smtp_user = os.getenv("SMTP_USER")
-          smtp_password = os.getenv("SMTP_PASSWORD")
-          recipient = os.getenv("RECIPIENT")
-
-          parts = []
-          for filename, label in [("ec2_outputs.json","EC2"), ("s3_outputs.json","S3")]:
-              if os.path.exists(filename):
-                  try:
-                      content = json.load(open(filename))
-                      if content:
-                          formatted = json.dumps(content, indent=2)
-                          parts.append(f"--- {label} outputs ({filename}) ---\n{formatted}\n")
-                  except Exception as e:
-                      parts.append(f"Could not read {filename}: {e}\n")
-          
-          body = "Terraform run completed.\n\n" + ("\n".join(parts) if parts else "No outputs found.")
-          
-          msg = EmailMessage()
-          msg["Subject"] = "Terraform run results"
-          msg["From"] = smtp_user or "no-reply@example.com"
-          msg["To"] = recipient
-          msg.set_content(body)
-          
-          if smtp_server and smtp_user and smtp_password:
-              try:
-                  s = smtplib.SMTP(smtp_server, smtp_port, timeout=30)
-                  s.starttls()
-                  s.login(smtp_user, smtp_password)
-                  s.send_message(msg)
-                  s.quit()
-                  print("Email sent to", recipient)
-              except Exception as e:
-                  print("Email send failed:", e)
-                  print("Email body below:\n")
-                  print(body)
-          else:
-              print("SMTP not configured; printing email body:\n")
-              print(body)
-          PY
+          RECIPIENT: ${{ steps.params.outputs.recipient_email }}
