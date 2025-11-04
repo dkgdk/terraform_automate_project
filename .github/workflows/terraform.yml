@@ -4,15 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       destroy:
-        description: "Destroy resources instead of creating?"
+        description: "Destroy resources?"
         required: true
         default: "false"
-        type: choice
-        options:
-          - "false"
-          - "true"
+        type: boolean
       resource:
-        description: "Which resources to deploy/destroy?"
+        description: "Which resource to act on"
         required: true
         default: "all"
         type: choice
@@ -21,12 +18,14 @@ on:
           - s3
           - all
       backend_bucket:
-        description: "S3 bucket for tfstate (default: bucketfortfstatestorage)"
-        required: false
-        default: "bucketfortfstatestorage"
-      recipient_email:
-        description: "Email to send deployment results to"
+        description: "S3 bucket for tfstate"
         required: true
+        default: "bucketfortfstatestorage"
+        type: string
+      recipient_email:
+        description: "Email to receive deployment result"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -34,30 +33,26 @@ permissions:
 jobs:
   terraform:
     runs-on: ubuntu-latest
-
     env:
-      TF_IN_AUTOMATION: "true"
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AWS_REGION: "ap-south-1"
+      TF_IN_AUTOMATION: true
 
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Terraform
+      - name: Set up Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.6.6"
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ap-south-1
 
-      - name: Prepare parameters
+      - name: Collect workflow inputs
         id: params
         run: |
           echo "destroy=${{ github.event.inputs.destroy }}" >> $GITHUB_OUTPUT
@@ -65,54 +60,47 @@ jobs:
           echo "backend_bucket=${{ github.event.inputs.backend_bucket }}" >> $GITHUB_OUTPUT
           echo "recipient_email=${{ github.event.inputs.recipient_email }}" >> $GITHUB_OUTPUT
 
-      - name: Run Terraform per module
-        id: tf_run
+      - name: Run Terraform
+        id: deploy
         run: |
           set -euo pipefail
           DESTROY="${{ steps.params.outputs.destroy }}"
           RESOURCE="${{ steps.params.outputs.resource }}"
           BUCKET="${{ steps.params.outputs.backend_bucket }}"
+          echo "Destroy: $DESTROY"
+          echo "Resource: $RESOURCE"
+          echo "Backend bucket: $BUCKET"
 
-          MODULES=()
+          modules=()
+          if [ "$RESOURCE" = "ec2" ] || [ "$RESOURCE" = "all" ]; then modules+=("ec2"); fi
+          if [ "$RESOURCE" = "s3" ] || [ "$RESOURCE" = "all" ]; then modules+=("s3"); fi
 
-          if [ "$RESOURCE" = "ec2" ] || [ "$RESOURCE" = "all" ]; then
-            MODULES+=("ec2")
-          fi
-          if [ "$RESOURCE" = "s3" ] || [ "$RESOURCE" = "all" ]; then
-            MODULES+=("s3")
-          fi
-
-          for m in "${MODULES[@]}"; do
-            echo "🚀 Processing module: $m"
-
-            cat > "$m/backend.hcl" <<EOF
-            bucket = "$BUCKET"
-            key    = "$m/terraform.tfstate"
+          for m in "${modules[@]}"; do
+            echo "Working on module: $m"
+            cat <<'EOF' > "$m/backend.hcl"
+            bucket = "${BUCKET}"
+            key    = "${m}/terraform.tfstate"
             region = "ap-south-1"
             encrypt = true
             EOF
 
             cd "$m"
             terraform init -backend-config=backend.hcl
-
             if [ "$DESTROY" = "true" ]; then
-              terraform destroy -auto-approve || true
+              terraform destroy -auto-approve
             else
               terraform apply -auto-approve
             fi
-
             terraform output -json > "../${m}_outputs.json" || true
             cd ..
           done
 
-      - name: Send Email with results
+      - name: Send deployment email (if script exists)
         if: always()
         run: |
-          chmod +x scripts/send_mail.sh
-          ./scripts/send_mail.sh
-        env:
-          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT }}
-          SMTP_USER: ${{ secrets.SMTP_USER }}
-          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-          RECIPIENT: ${{ steps.params.outputs.recipient_email }}
+          if [ -f "scripts/send_mail.sh" ]; then
+            chmod +x scripts/send_mail.sh
+            scripts/send_mail.sh "${{ steps.params.outputs.recipient_email }}"
+          else
+            echo "😡 ERROR: scripts/send_mail.sh not found. Skipping email."
+          fi
