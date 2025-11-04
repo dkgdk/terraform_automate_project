@@ -9,7 +9,7 @@ on:
         default: "false"
         type: boolean
       resource:
-        description: "Resource to apply/destroy"
+        description: "Which resource to act on"
         required: true
         default: "all"
         type: choice
@@ -17,12 +17,8 @@ on:
           - ec2
           - s3
           - all
-      backend_bucket:
-        description: "S3 bucket name for tfstate"
-        required: true
-        default: "bucketfortfstatestorage"
       recipient_email:
-        description: "Email to send deployment result"
+        description: "Email to receive Terraform results"
         required: true
         type: string
 
@@ -33,63 +29,83 @@ jobs:
   terraform:
     runs-on: ubuntu-latest
     env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AWS_REGION: ap-south-1
       TF_IN_AUTOMATION: true
+      BACKEND_BUCKET: bucketfortfstatestorage
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Terraform
+      - name: Debug repo tree
+        run: ls -R .
+
+      - name: Set up Terraform
         uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: 1.9.5
+          terraform_version: "1.5.7"
 
-      - name: Set execution params
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-south-1
+
+      - name: Read workflow inputs
         id: params
         run: |
-          echo "DESTROY=${{ github.event.inputs.destroy }}" >> $GITHUB_ENV
-          echo "RESOURCE=${{ github.event.inputs.resource }}" >> $GITHUB_ENV
-          echo "BUCKET=${{ github.event.inputs.backend_bucket }}" >> $GITHUB_ENV
-          echo "RECIPIENT=${{ github.event.inputs.recipient_email }}" >> $GITHUB_ENV
+          echo "destroy=${{ github.event.inputs.destroy }}" >> $GITHUB_OUTPUT
+          echo "resource=${{ github.event.inputs.resource }}" >> $GITHUB_OUTPUT
+          echo "recipient_email=${{ github.event.inputs.recipient_email }}" >> $GITHUB_OUTPUT
 
       - name: Run Terraform
         id: run_tf
         run: |
           set -euo pipefail
+          DESTROY="${{ steps.params.outputs.destroy }}"
+          RESOURCE="${{ steps.params.outputs.resource }}"
+          EMAIL="${{ steps.params.outputs.recipient_email }}"
+          BUCKET="$BACKEND_BUCKET"
+
           echo "Destroy: $DESTROY"
           echo "Resource: $RESOURCE"
           echo "Backend bucket: $BUCKET"
+          echo "Email: $EMAIL"
 
-          dirs=()
-          if [ "$RESOURCE" = "ec2" ] || [ "$RESOURCE" = "all" ]; then dirs+=("ec2"); fi
-          if [ "$RESOURCE" = "s3" ] || [ "$RESOURCE" = "all" ]; then dirs+=("s3"); fi
+          apply_dirs=()
+          if [ "$RESOURCE" = "ec2" ] || [ "$RESOURCE" = "all" ]; then
+            apply_dirs+=("ec2")
+          fi
+          if [ "$RESOURCE" = "s3" ] || [ "$RESOURCE" = "all" ]; then
+            apply_dirs+=("s3")
+          fi
 
-          for d in "${dirs[@]}"; do
-            echo "Working on: $d"
+          for d in "${apply_dirs[@]}"; do
+            echo "🔹 Working on module: $d"
+
             cat > $d/backend.hcl <<EOF
-            bucket  = "$BUCKET"
-            key     = "$d/terraform.tfstate"
-            region  = "ap-south-1"
-            encrypt = true
-            EOF
+          bucket = "${BUCKET}"
+          key    = "${d}/terraform.tfstate"
+          region = "ap-south-1"
+          encrypt = true
+          EOF
+
             cd $d
-            terraform init -backend-config=backend.hcl
+            terraform init -backend-config=backend.hcl -input=false
+
             if [ "$DESTROY" = "true" ]; then
               terraform destroy -auto-approve
             else
               terraform apply -auto-approve
             fi
+
             terraform output -json > ../${d}_outputs.json || true
             cd ..
           done
 
-      - name: Make email script executable
+      - name: Make send_mail.sh executable
         run: chmod +x scripts/send_mail.sh
 
-      - name: Send email
+      - name: Send email with results
         if: always()
         env:
           SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
@@ -97,4 +113,5 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           RECIPIENT: ${{ github.event.inputs.recipient_email }}
-        run: scripts/send_mail.sh
+        run: |
+          ./scripts/send_mail.sh
