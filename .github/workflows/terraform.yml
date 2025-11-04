@@ -97,11 +97,11 @@ jobs:
 
             # create backend.hcl for this module
             cat > $d/backend.hcl <<EOF
-bucket = "${BUCKET}"
-key    = "${d}/terraform.tfstate"
-region = "ap-south-1"
-encrypt = true
-EOF
+            bucket = "${BUCKET}"
+            key    = "${d}/terraform.tfstate"
+            region = "ap-south-1"
+            encrypt = true
+            EOF
 
             pushd $d
 
@@ -138,47 +138,47 @@ EOF
           RECIPIENT: ${{ github.event.inputs.recipient_email }}
         run: |
           python - <<'PY'
-import os, json, smtplib
-from email.message import EmailMessage
+          import os, json, smtplib
+          from email.message import EmailMessage
+          
+          smtp_server = os.getenv("SMTP_SERVER")
+          smtp_port = int(os.getenv("SMTP_PORT") or 587)
+          smtp_user = os.getenv("SMTP_USER")
+          smtp_password = os.getenv("SMTP_PASSWORD")
+          recipient = os.getenv("RECIPIENT")
 
-smtp_server = os.getenv("SMTP_SERVER")
-smtp_port = int(os.getenv("SMTP_PORT") or 587)
-smtp_user = os.getenv("SMTP_USER")
-smtp_password = os.getenv("SMTP_PASSWORD")
-recipient = os.getenv("RECIPIENT")
-
-parts = []
-for filename, label in [("ec2_outputs.json","EC2"), ("s3_outputs.json","S3")]:
-    if os.path.exists(filename):
-        try:
-            content = json.load(open(filename))
-            if content:
-                formatted = json.dumps(content, indent=2)
-                parts.append(f"--- {label} outputs ({filename}) ---\n{formatted}\n")
-        except Exception as e:
-            parts.append(f"Could not read {filename}: {e}\n")
-
-body = "Terraform run completed.\n\n" + ("\n".join(parts) if parts else "No outputs found.")
-
-msg = EmailMessage()
-msg["Subject"] = "Terraform run results"
-msg["From"] = smtp_user or "no-reply@example.com"
-msg["To"] = recipient
-msg.set_content(body)
-
-if smtp_server and smtp_user and smtp_password:
-    try:
-        s = smtplib.SMTP(smtp_server, smtp_port, timeout=30)
-        s.starttls()
-        s.login(smtp_user, smtp_password)
-        s.send_message(msg)
-        s.quit()
-        print("Email sent to", recipient)
-    except Exception as e:
-        print("Email send failed:", e)
-        print("Email body below:\n")
-        print(body)
-else:
-    print("SMTP not configured; printing email body:\n")
-    print(body)
-PY
+          parts = []
+          for filename, label in [("ec2_outputs.json","EC2"), ("s3_outputs.json","S3")]:
+              if os.path.exists(filename):
+                  try:
+                      content = json.load(open(filename))
+                      if content:
+                          formatted = json.dumps(content, indent=2)
+                          parts.append(f"--- {label} outputs ({filename}) ---\n{formatted}\n")
+                  except Exception as e:
+                      parts.append(f"Could not read {filename}: {e}\n")
+          
+          body = "Terraform run completed.\n\n" + ("\n".join(parts) if parts else "No outputs found.")
+          
+          msg = EmailMessage()
+          msg["Subject"] = "Terraform run results"
+          msg["From"] = smtp_user or "no-reply@example.com"
+          msg["To"] = recipient
+          msg.set_content(body)
+          
+          if smtp_server and smtp_user and smtp_password:
+              try:
+                  s = smtplib.SMTP(smtp_server, smtp_port, timeout=30)
+                  s.starttls()
+                  s.login(smtp_user, smtp_password)
+                  s.send_message(msg)
+                  s.quit()
+                  print("Email sent to", recipient)
+              except Exception as e:
+                  print("Email send failed:", e)
+                  print("Email body below:\n")
+                  print(body)
+          else:
+              print("SMTP not configured; printing email body:\n")
+              print(body)
+          PY
