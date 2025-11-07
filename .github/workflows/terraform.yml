@@ -51,6 +51,21 @@ jobs:
           echo "Backend bucket: $BACKEND_BUCKET"
 
       ############################################################
+      # Check if Terraform State Exists in S3
+      ############################################################
+      - name: Check S3 State File
+        id: check_state
+        run: |
+          echo "Checking for existing Terraform state in S3..."
+          if aws s3 ls s3://$BACKEND_BUCKET/$BACKEND_KEY; then
+            echo "state_exists=true" >> $GITHUB_ENV
+            echo "✅ State file found in S3"
+          else
+            echo "state_exists=false" >> $GITHUB_ENV
+            echo "⚠️ No state file found in S3 — new deployment will be created"
+          fi
+
+      ############################################################
       # Terraform Init (S3 Backend)
       ############################################################
       - name: Terraform Init (S3 Backend)
@@ -69,13 +84,23 @@ jobs:
         id: plan
         run: terraform plan -out=tfplan
 
-      - name: Terraform Apply
-        if: github.event.inputs.destroy == 'no'
-        run: terraform apply -auto-approve tfplan
+      - name: Terraform Apply (Create or Update)
+        if: env.state_exists == 'true' && github.event.inputs.destroy == 'no'
+        run: |
+          echo "🟢 Updating existing infrastructure..."
+          terraform apply -auto-approve tfplan
+
+      - name: Terraform Apply (First Time)
+        if: env.state_exists == 'false' && github.event.inputs.destroy == 'no'
+        run: |
+          echo "🟢 Creating new infrastructure..."
+          terraform apply -auto-approve tfplan
 
       - name: Terraform Destroy
         if: github.event.inputs.destroy == 'yes'
-        run: terraform destroy -auto-approve
+        run: |
+          echo "🧨 Destroying all Terraform-managed resources..."
+          terraform destroy -auto-approve
 
       ############################################################
       # Collect Terraform Outputs
