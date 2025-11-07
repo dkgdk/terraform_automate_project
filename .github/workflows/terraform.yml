@@ -7,18 +7,17 @@ on:
         type: choice
         description: "Destroy resources?"
         default: "no"
-        options:
-          - "no"
-          - "yes"
+        options: ["no","yes"]
 
       resource:
         type: choice
         description: "Select resource type"
-        default: "all"
-        options:
-          - "all"
-          - "ec2"
-          - "s3"
+        default: "ec2"
+        options: ["ec2","s3","all"]
+
+      backend_bucket:
+        description: "S3 bucket name used for Terraform remote state (create from backend module first)"
+        required: true
 
       recipient_email:
         description: "Email to receive results"
@@ -28,95 +27,79 @@ on:
 jobs:
   terraform:
     runs-on: ubuntu-latest
-    
     env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       AWS_REGION: "ap-south-1"
-      BACKEND_BUCKET: "bucketfortfstatestorage"
-      BACKEND_KEY: "terraform.tfstate"
-      BACKEND_DYNAMODB: "terraform-lock-table"
+      BACKEND_BUCKET: ${{ github.event.inputs.backend_bucket }}
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Install Terraform
         uses: hashicorp/setup-terraform@v3
 
-      - name: Show Inputs
+      - name: Decide modules
+        id: modules
         run: |
-          echo "Destroy: ${{ github.event.inputs.destroy }}"
-          echo "Resource: ${{ github.event.inputs.resource }}"
-
-      ############################################################
-      # Check if Terraform State Exists in S3
-      ############################################################
-      - name: Check S3 State File
-        id: check_state
-        run: |
-          if aws s3 ls s3://$BACKEND_BUCKET/$BACKEND_KEY; then
-            echo "state_exists=true" >> $GITHUB_ENV
-            echo "✅ State file found in S3"
+          echo "Requested resource: ${{ github.event.inputs.resource }}"
+          if [ "${{ github.event.inputs.resource }}" = "all" ]; then
+            echo "modules=ec2 s3" >> $GITHUB_OUTPUT
           else
-            echo "state_exists=false" >> $GITHUB_ENV
-            echo "⚠️ No state file found — new deployment will be created"
+            echo "modules=${{ github.event.inputs.resource }}" >> $GITHUB_OUTPUT
           fi
 
-      ############################################################
-      # Terraform Init (S3 Backend)
-      ############################################################
-      - name: Terraform Init (S3 Backend)
+      - name: Loop modules (init/plan/apply/destroy) and check state in S3
+        id: loop
         run: |
-          terraform init -input=false \
-            -backend-config="bucket=$BACKEND_BUCKET" \
-            -backend-config="key=$BACKEND_KEY" \
-            -backend-config="region=$AWS_REGION" \
-            -backend-config="dynamodb_table=$BACKEND_DYNAMODB" \
-            -backend-config="encrypt=true"
+          set -euo pipefail
+          IFS=' ' read -r -a mods <<< "${{ steps.modules.outputs.modules }}"
+          for m in "${mods[@]}"; do
+            echo "=== Working on module: $m ==="
+            PUSH_DIR="$m"
+            BACKEND_KEY="$m/terraform.tfstate"
+            echo "Checking if state exists: s3://${{ env.BACKEND_BUCKET }}/${BACKEND_KEY}"
+            if aws s3 ls "s3://${{ env.BACKEND_BUCKET }}/${BACKEND_KEY}" ; then
+              echo "state_exists=true" >> $GITHUB_ENV
+              echo "Found existing state for ${m}"
+            else
+              echo "state_exists=false" >> $GITHUB_ENV
+              echo "No state file found for ${m}; this will be a fresh deployment"
+            fi
 
-      ############################################################
-      # Terraform Plan / Apply / Destroy
-      ############################################################
-      - name: Terraform Plan
-        id: plan
-        run: terraform plan -out=tfplan
+            cd "$PUSH_DIR"
 
-      - name: Terraform Apply (Create or Update)
-        if: github.event.inputs.destroy == 'no'
-        run: terraform apply -auto-approve tfplan
+            terraform init -input=false -backend-config="bucket=${{ env.BACKEND_BUCKET }}" -backend-config="key=${BACKEND_KEY}" -backend-config="region=${{ env.AWS_REGION }}" -reconfigure
 
-      - name: Terraform Destroy
-        if: github.event.inputs.destroy == 'yes'
-        run: terraform destroy -auto-approve
+            if [ "${{ github.event.inputs.destroy }}" = "yes" ]; then
+              echo "Destroying resources for module ${m}..."
+              terraform destroy -auto-approve || true
+            else
+              echo "Planning and applying for module ${m}..."
+              terraform plan -out=tfplan -input=false
+              terraform apply -auto-approve tfplan
+            fi
 
-      ############################################################
-      # Collect Terraform Outputs (EC2 + S3)
-      ############################################################
-      - name: Collect Terraform Outputs
-        if: github.event.inputs.destroy == 'no'
-        id: outputs
-        run: |
-          echo "Collecting Terraform outputs..."
-          terraform output -json > tf_outputs.json
-          cat tf_outputs.json
-          echo "TF_OUTPUTS_JSON=$(cat tf_outputs.json | base64 -w 0)" >> $GITHUB_ENV
+            if [ "${{ github.event.inputs.destroy }}" = "no" ]; then
+              terraform output -json > ../${m}_outputs.json || true
+            fi
+            cd ..
+          done
 
-      ############################################################
-      # Upload PEM File as Artifact
-      ############################################################
-      - name: Upload PEM Key as Artifact
-        if: github.event.inputs.destroy == 'no'
+      - name: Upload PEM artifact (if exists)
         uses: actions/upload-artifact@v4
         with:
           name: ec2-private-key
-          path: ./tf-key.pem
+          path: ec2/tf-key.pem
           if-no-files-found: ignore
 
-      ############################################################
-      # EMAIL NOTIFICATION WITH EC2 + S3 DETAILS
-      ############################################################
-      - name: Send Email Results
+      - name: Send Email with outputs
         if: always()
         env:
           SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
@@ -124,70 +107,18 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           RECIPIENT: ${{ github.event.inputs.recipient_email }}
-          TF_STATUS: ${{ job.status }}
-          TF_OUTPUTS_JSON: ${{ env.TF_OUTPUTS_JSON }}
         run: |
-          echo "Sending email to $RECIPIENT..."
-          python3 - <<EOF
-          import smtplib, os, json, base64
-          from email.mime.text import MIMEText
+          echo "Preparing email body..."
+          BODY="Terraform Workflow Results\n\n"
+          for f in ec2_outputs.json s3_outputs.json; do
+            if [ -f "$f" ]; then
+              BODY+="--- $f ---\n"
+              BODY+=$(cat $f)
+              BODY+="\n\n"
+            fi
+          done
+          BODY+="PEM artifact (if created) available in workflow artifacts."
+          echo -e "$BODY" > email_body.txt
 
-          smtp_server = os.getenv("SMTP_SERVER")
-          smtp_port = int(os.getenv("SMTP_PORT"))
-          smtp_user = os.getenv("SMTP_USER")
-          smtp_password = os.getenv("SMTP_PASSWORD")
-          recipient = os.getenv("RECIPIENT")
-          status = os.getenv("TF_STATUS")
-
-          tf_outputs_json = os.getenv("TF_OUTPUTS_JSON")
-          outputs = {}
-          if tf_outputs_json:
-              try:
-                  outputs = json.loads(base64.b64decode(tf_outputs_json))
-              except Exception as e:
-                  print("Error decoding outputs:", e)
-
-          details = ""
-          for key, val in outputs.items():
-              v = val.get("value", val)
-              if isinstance(v, (list, dict)):
-                  details += f"{key}: {json.dumps(v, indent=2)}\\n"
-              else:
-                  details += f"{key}: {v}\\n"
-
-          body = f"""
-          Terraform Workflow Result
-
-          🏗️ Action Summary
-          -----------------
-          Destroy:  ${{ github.event.inputs.destroy }}
-          Resource: ${{ github.event.inputs.resource }}
-          Status:   {status}
-
-          🌐 Resource Details
-          -----------------
-          {details or "No Terraform outputs found."}
-
-          🔐 PEM Key
-          -----------------
-          PEM private key securely stored as artifact:
-          Go to: GitHub Actions → Run Summary → Artifacts → ec2-private-key
-
-          Regards,
-          Terraform GitHub Actions Bot
-          """
-
-          msg = MIMEText(body)
-          msg["Subject"] = f"Terraform {status.upper()} - EC2/S3 Details"
-          msg["From"] = smtp_user
-          msg["To"] = recipient
-
-          try:
-              with smtplib.SMTP(smtp_server, smtp_port) as server:
-                  server.starttls()
-                  server.login(smtp_user, smtp_password)
-                  server.sendmail(smtp_user, recipient, msg.as_string())
-              print("✅ Email sent successfully!")
-          except Exception as e:
-              print(f"❌ Email sending failed: {e}")
-          EOF
+          # send via curl (requires SMTP secrets)
+          curl --ssl-reqd --url "smtp://${SMTP_SERVER}:${SMTP_PORT}" --user "${SMTP_USER}:${SMTP_PASSWORD}"                     --mail-from "${SMTP_USER}" --mail-rcpt "${RECIPIENT}" --upload-file email_body.txt || true
