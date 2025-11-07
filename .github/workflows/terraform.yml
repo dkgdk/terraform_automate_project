@@ -44,11 +44,10 @@ jobs:
       - name: Install Terraform
         uses: hashicorp/setup-terraform@v3
 
-      - name: Show Selected Inputs
+      - name: Show Inputs
         run: |
           echo "Destroy: ${{ github.event.inputs.destroy }}"
           echo "Resource: ${{ github.event.inputs.resource }}"
-          echo "Backend bucket: $BACKEND_BUCKET"
 
       ############################################################
       # Check if Terraform State Exists in S3
@@ -56,13 +55,12 @@ jobs:
       - name: Check S3 State File
         id: check_state
         run: |
-          echo "Checking for existing Terraform state in S3..."
           if aws s3 ls s3://$BACKEND_BUCKET/$BACKEND_KEY; then
             echo "state_exists=true" >> $GITHUB_ENV
             echo "✅ State file found in S3"
           else
             echo "state_exists=false" >> $GITHUB_ENV
-            echo "⚠️ No state file found in S3 — new deployment will be created"
+            echo "⚠️ No state file found — new deployment will be created"
           fi
 
       ############################################################
@@ -85,27 +83,17 @@ jobs:
         run: terraform plan -out=tfplan
 
       - name: Terraform Apply (Create or Update)
-        if: env.state_exists == 'true' && github.event.inputs.destroy == 'no'
-        run: |
-          echo "🟢 Updating existing infrastructure..."
-          terraform apply -auto-approve tfplan
-
-      - name: Terraform Apply (First Time)
-        if: env.state_exists == 'false' && github.event.inputs.destroy == 'no'
-        run: |
-          echo "🟢 Creating new infrastructure..."
-          terraform apply -auto-approve tfplan
+        if: github.event.inputs.destroy == 'no'
+        run: terraform apply -auto-approve tfplan
 
       - name: Terraform Destroy
         if: github.event.inputs.destroy == 'yes'
-        run: |
-          echo "🧨 Destroying all Terraform-managed resources..."
-          terraform destroy -auto-approve
+        run: terraform destroy -auto-approve
 
       ############################################################
-      # Collect Terraform Outputs
+      # Collect Terraform Outputs (EC2 + S3)
       ############################################################
-      - name: Collect Resource Outputs
+      - name: Collect Terraform Outputs
         if: github.event.inputs.destroy == 'no'
         id: outputs
         run: |
@@ -115,7 +103,7 @@ jobs:
           echo "TF_OUTPUTS_JSON=$(cat tf_outputs.json | base64 -w 0)" >> $GITHUB_ENV
 
       ############################################################
-      # Upload PEM File as Artifact (if exists)
+      # Upload PEM File as Artifact
       ############################################################
       - name: Upload PEM Key as Artifact
         if: github.event.inputs.destroy == 'no'
@@ -126,7 +114,7 @@ jobs:
           if-no-files-found: ignore
 
       ############################################################
-      # EMAIL NOTIFICATION
+      # EMAIL NOTIFICATION WITH EC2 + S3 DETAILS
       ############################################################
       - name: Send Email Results
         if: always()
@@ -151,37 +139,46 @@ jobs:
           recipient = os.getenv("RECIPIENT")
           status = os.getenv("TF_STATUS")
 
-          # Decode Terraform outputs
           tf_outputs_json = os.getenv("TF_OUTPUTS_JSON")
+          outputs = {}
           if tf_outputs_json:
-              outputs = json.loads(base64.b64decode(tf_outputs_json))
-          else:
-              outputs = {}
+              try:
+                  outputs = json.loads(base64.b64decode(tf_outputs_json))
+              except Exception as e:
+                  print("Error decoding outputs:", e)
 
           details = ""
           for key, val in outputs.items():
-              details += f"{key}: {val.get('value', val)}\\n"
+              v = val.get("value", val)
+              if isinstance(v, (list, dict)):
+                  details += f"{key}: {json.dumps(v, indent=2)}\\n"
+              else:
+                  details += f"{key}: {v}\\n"
 
           body = f"""
-          Terraform Workflow Finished
+          Terraform Workflow Result
 
+          🏗️ Action Summary
+          -----------------
           Destroy:  ${{ github.event.inputs.destroy }}
           Resource: ${{ github.event.inputs.resource }}
           Status:   {status}
 
-          Resource Details:
+          🌐 Resource Details
           -----------------
-          {details or "No outputs available."}
+          {details or "No Terraform outputs found."}
 
-          ✅ PEM private key securely stored as workflow artifact.
-          Go to GitHub Actions → Artifacts → ec2-private-key to download.
+          🔐 PEM Key
+          -----------------
+          PEM private key securely stored as artifact:
+          Go to: GitHub Actions → Run Summary → Artifacts → ec2-private-key
 
           Regards,
-          GitHub Actions Bot
+          Terraform GitHub Actions Bot
           """
 
           msg = MIMEText(body)
-          msg["Subject"] = f"Terraform Result - {status.upper()}"
+          msg["Subject"] = f"Terraform {status.upper()} - EC2/S3 Details"
           msg["From"] = smtp_user
           msg["To"] = recipient
 
