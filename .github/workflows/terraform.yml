@@ -17,6 +17,7 @@ on:
 
       backend_bucket:
         description: "S3 bucket name used for Terraform remote state (create from backend module first)"
+        default: "bucketfortfstatestorage"
         required: true
 
       recipient_email:
