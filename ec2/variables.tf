@@ -15,3 +15,8 @@ variable "instance_name" {
     type = string 
     default = "ubuntu1" 
     }
+
+variable "aws_region" {
+  description = "AWS region to deploy EC2 instance"
+  default     = "ap-south-1"
+}
